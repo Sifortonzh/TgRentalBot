@@ -1,6 +1,7 @@
 import os
 import openai
-from telegram import Update, ParseMode
+from telegram import Update
+from telegram.constants import ParseMode
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
 
 # 环境变量
@@ -79,5 +80,5 @@ if __name__ == "__main__":
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
-    print("TgRentalBot with GPT (文艺调皮版) is running...")
+    print("TgRentalBot with GPT is running...")
     app.run_polling()
