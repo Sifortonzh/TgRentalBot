@@ -58,13 +58,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_messages[uid].append(text)
         user_messages[uid] = user_messages[uid][-5:]
 
-        prompt = (
-            "Please summarize the following user messages into concise, useful points "
-            "for the group owner. Focus on any keyword-related content.
-
-" +
-            "\n".join(user_messages[uid])
-        )
+        prompt = "Please summarize the following user messages into concise, useful points for the group owner. Focus on any keyword-related content.\n\n" + "\n".join(user_messages[uid])
         summary = await ask_gpt(prompt)
 
         forward_text = (
