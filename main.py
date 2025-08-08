@@ -1,31 +1,20 @@
 import os
-<<<<<<< HEAD
 import asyncio
 from openai import OpenAI
 from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, CommandHandler, filters
-=======
-import openai
-from telegram import Update
-from telegram.constants import ParseMode
-from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
->>>>>>> 7b060b5041f71e7534763dedd73bb22015ba166b
 
 # 环境变量
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID"))
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-<<<<<<< HEAD
 # 初始化 OpenAI 客户端
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 # 默认模型
 current_model = "gpt-5-mini"
-=======
-openai.api_key = OPENAI_API_KEY
->>>>>>> 7b060b5041f71e7534763dedd73bb22015ba166b
 
 # 自定义 AI 助手风格
 SYSTEM_PROMPT = (
@@ -35,25 +24,16 @@ SYSTEM_PROMPT = (
     "别太端着，也别太舔。"
 )
 
-<<<<<<< HEAD
 # GPT 调用函数（异步包装同步接口）
 async def ask_gpt(prompt: str, model: str) -> str:
     def _run():
         resp = client.chat.completions.create(
             model=model,
-=======
-# GPT 调用函数
-async def ask_gpt(prompt: str) -> str:
-    try:
-        response = openai.ChatCompletion.create(
-            model="gpt-4o",
->>>>>>> 7b060b5041f71e7534763dedd73bb22015ba166b
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": prompt}
             ],
         )
-<<<<<<< HEAD
         return resp.choices[0].message.content.strip()
 
     try:
@@ -75,12 +55,6 @@ async def set_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text(f"ℹ️ Current model: {current_model}")
 
-=======
-        return response.choices[0].message.content.strip()
-    except Exception as e:
-        return f"❌ Error from GPT: {e}"
-
->>>>>>> 7b060b5041f71e7534763dedd73bb22015ba166b
 user_messages = {}
 KEYWORDS = ["Netflix", "YouTube", "shared", "rent", "group", "上车", "合租"]
 
@@ -95,11 +69,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 私聊：AI 聊天
     if chat_type == "private":
-<<<<<<< HEAD
         reply = await ask_gpt(text, current_model)
-=======
-        reply = await ask_gpt(text)
->>>>>>> 7b060b5041f71e7534763dedd73bb22015ba166b
         await message.reply_text(reply, parse_mode=ParseMode.MARKDOWN)
         return
 
@@ -112,11 +82,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_messages[uid] = user_messages[uid][-5:]
 
         prompt = "Please summarize the following user messages into concise, useful points for the group owner. Focus on any keyword-related content.\n\n" + "\n".join(user_messages[uid])
-<<<<<<< HEAD
         summary = await ask_gpt(prompt, current_model)
-=======
-        summary = await ask_gpt(prompt)
->>>>>>> 7b060b5041f71e7534763dedd73bb22015ba166b
 
         forward_text = (
             f"📩 From: @{username}\n🆔 User ID: {uid}\n"
@@ -135,12 +101,7 @@ if __name__ == "__main__":
         raise ValueError("Missing required environment variables.")
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
-<<<<<<< HEAD
     app.add_handler(CommandHandler("model", set_model))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
     print("TgRentalBot with GPT-5-mini is running...")
-=======
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
-    print("TgRentalBot with GPT is running...")
->>>>>>> 7b060b5041f71e7534763dedd73bb22015ba166b
     app.run_polling()
