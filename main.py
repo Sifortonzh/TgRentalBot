@@ -1,140 +1,62 @@
 import os
-import asyncio
+from telegram import Update, ParseMode
+from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
 from openai import OpenAI
-from telegram import Update
-from telegram.constants import ParseMode
-from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, CommandHandler, filters
 
-# 环境变量
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+TOKEN = os.getenv("BOT_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID"))
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# 初始化 OpenAI 客户端
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# 默认模型
-current_model = "gpt-5-mini"
+mode = {}
 
-# 聊天模式开关（False = 只转发模式，True = 聊天模式）
-chat_mode = False
+def start(update: Update, context: CallbackContext):
+    mode[update.effective_chat.id] = "forward"
+    update.message.reply_text("📨 Forwarding mode enabled.")
 
-# 自定义 AI 助手风格
-SYSTEM_PROMPT = (
-    "你是一个风格独特的 AI 助手，说话有点拽，风趣但不低俗，"
-    "中文为主，偶尔夹杂英文。你擅长用文艺、哲理、调皮的语言回答问题，"
-    "不走寻常路，拒绝废话，回答要简洁有力，偶尔带点诗意或黑色幽默。"
-    "别太端着，也别太舔。"
-)
+def chat(update: Update, context: CallbackContext):
+    mode[update.effective_chat.id] = "chat"
+    update.message.reply_text("💬 Chat mode enabled.")
 
-# GPT 调用函数（异步包装同步接口）
-async def ask_gpt(prompt: str, model: str) -> str:
-    def _run():
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": prompt}
-            ],
-        )
-        return resp.choices[0].message.content.strip()
+def handle_message(update: Update, context: CallbackContext):
+    chat_id = update.effective_chat.id
+    text = update.message.text
 
-    try:
-        return await asyncio.to_thread(_run)
-    except Exception as e:
-        return f"❌ Error from GPT: {e}"
-
-# 切换模型命令
-async def set_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global current_model
-    if context.args:
-        model_choice = context.args[0]
-        allowed = ["gpt-5-mini", "gpt-5", "gpt-5-pro"]
-        if model_choice in allowed:
-            current_model = model_choice
-            await update.message.reply_text(f"✅ Model switched to: {current_model}")
-        else:
-            await update.message.reply_text(f"❌ Invalid model. Allowed: {', '.join(allowed)}")
-    else:
-        await update.message.reply_text(f"ℹ️ Current model: {current_model}")
-
-# 切换模式命令
-async def start_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global chat_mode
-    chat_mode = False
-    await update.message.reply_text("🔔 已切换到 *只转发模式*（私聊将转发给 OWNER，不调用 GPT）。", parse_mode=ParseMode.MARKDOWN)
-
-async def chat_mode_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global chat_mode
-    chat_mode = True
-    await update.message.reply_text("💬 已切换到 *聊天模式*（私聊将调用 GPT）。", parse_mode=ParseMode.MARKDOWN)
-
-user_messages = {}
-KEYWORDS = ["Netflix", "YouTube", "shared", "rent", "group", "上车", "合租"]
-
-# 消息处理
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.message
-    user = update.effective_user
-    chat_type = message.chat.type
-    uid = user.id
-    username = user.username or "NoUsername"
-    text = message.text or "[non-text message]"
-
-    # 私聊：按模式处理
-    if chat_type == "private":
-        if chat_mode:
-            # 聊天模式：直接调用 GPT
-            reply = await ask_gpt(text, current_model)
-            await message.reply_text(reply, parse_mode=ParseMode.MARKDOWN)
-        else:
-            # 只转发模式：把私聊消息转发给 OWNER
-            forward_text = (
-                f"📬 *Private DM*
-"
-                f"👤 From: @{username}
-"
-                f"🆔 User ID: {uid}
-"
-                f"💬 Message:
-{text}"
+    if mode.get(chat_id) == "chat":
+        try:
+            response = client.chat.completions.create(
+                model="gpt-5-mini",
+                messages=[
+                    {"role": "system", "content": "You are a helpful assistant."},
+                    {"role": "user", "content": text}
+                ]
             )
-            await context.bot.send_message(chat_id=OWNER_ID, text=forward_text, parse_mode=ParseMode.MARKDOWN)
-            # 告知用户已转发
-            await message.reply_text("✅ 已转发你的消息给管理员。")
-        return
+            reply_text = response.choices[0].message["content"]
+            update.message.reply_text(reply_text, parse_mode=ParseMode.MARKDOWN)
+        except Exception as e:
+            update.message.reply_text(f"❌ Error: {e}")
+    else:
+        # Forward to owner
+        header = "\n".join([
+            f"👤 *Private DM*",
+            f"From: `{update.effective_user.full_name}`",
+            f"User ID: `{update.effective_user.id}`"
+        ])
+        context.bot.send_message(OWNER_ID, header + "\n\n" + text, parse_mode=ParseMode.MARKDOWN)
 
-    # 群聊关键词监听 + 摘要转发
-    triggered = any(keyword.lower() in text.lower() for keyword in KEYWORDS)
-    if triggered:
-        if uid not in user_messages:
-            user_messages[uid] = []
-        user_messages[uid].append(text)
-        user_messages[uid] = user_messages[uid][-5:]
+def main():
+    updater = Updater(TOKEN, use_context=True)
+    dp = updater.dispatcher
 
-        prompt = "Please summarize the following user messages into concise, useful points for the group owner. Focus on any keyword-related content.\n\n" + "\n".join(user_messages[uid])
-        summary = await ask_gpt(prompt, current_model)
+    dp.add_handler(CommandHandler("start", start))
+    dp.add_handler(CommandHandler("chat", chat))
+    dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_message))
 
-        forward_text = (
-            f"📩 From: @{username}\n🆔 User ID: {uid}\n"
-            f"🗣 Recent Messages:\n" + "\n".join(user_messages[uid]) + "\n\n"
-            f"🧠 Summary by GPT:\n{summary}"
-        )
-        await context.bot.send_message(chat_id=OWNER_ID, text=forward_text)
-
-        await message.reply_text(
-            f"🔔 Hey @{username}, your message triggered a keyword alert!",
-            parse_mode=ParseMode.MARKDOWN
-        )
+    updater.start_polling()
+    updater.idle()
 
 if __name__ == "__main__":
-    if not BOT_TOKEN or not OPENAI_API_KEY:
+    if not TOKEN or not OWNER_ID or not OPENAI_API_KEY:
         raise ValueError("Missing required environment variables.")
-
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("model", set_model))
-    app.add_handler(CommandHandler("start", start_mode))
-    app.add_handler(CommandHandler("chat", chat_mode_on))
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
-    print("TgRentalBot with GPT-5-mini (模式切换+私聊转发) is running...")
-    app.run_polling()
+    main()
