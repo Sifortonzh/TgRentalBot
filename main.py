@@ -16,6 +16,9 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 # 默认模型
 current_model = "gpt-5-mini"
 
+# 聊天模式开关（False = 只转发模式，True = 聊天模式）
+chat_mode = False
+
 # 自定义 AI 助手风格
 SYSTEM_PROMPT = (
     "你是一个风格独特的 AI 助手，说话有点拽，风趣但不低俗，"
@@ -55,6 +58,17 @@ async def set_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text(f"ℹ️ Current model: {current_model}")
 
+# 切换模式命令
+async def start_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global chat_mode
+    chat_mode = False
+    await update.message.reply_text("🔔 已切换到 *只转发模式*，私聊不会调用 GPT。", parse_mode=ParseMode.MARKDOWN)
+
+async def chat_mode_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global chat_mode
+    chat_mode = True
+    await update.message.reply_text("💬 已切换到 *聊天模式*，私聊会调用 GPT。", parse_mode=ParseMode.MARKDOWN)
+
 user_messages = {}
 KEYWORDS = ["Netflix", "YouTube", "shared", "rent", "group", "上车", "合租"]
 
@@ -67,10 +81,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     username = user.username or "NoUsername"
     text = message.text or "[non-text message]"
 
-    # 私聊：AI 聊天
+    # 私聊：仅在聊天模式下调用 GPT
     if chat_type == "private":
-        reply = await ask_gpt(text, current_model)
-        await message.reply_text(reply, parse_mode=ParseMode.MARKDOWN)
+        if chat_mode:
+            reply = await ask_gpt(text, current_model)
+            await message.reply_text(reply, parse_mode=ParseMode.MARKDOWN)
+        else:
+            await message.reply_text("ℹ️ 当前是只转发模式，私聊不调用 GPT。")
         return
 
     # 群聊关键词监听 + 摘要转发
@@ -102,6 +119,8 @@ if __name__ == "__main__":
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("model", set_model))
+    app.add_handler(CommandHandler("start", start_mode))
+    app.add_handler(CommandHandler("chat", chat_mode_on))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
-    print("TgRentalBot with GPT-5-mini is running...")
+    print("TgRentalBot with GPT-5-mini (模式切换版) is running...")
     app.run_polling()
