@@ -62,12 +62,12 @@ async def set_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def start_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global chat_mode
     chat_mode = False
-    await update.message.reply_text("🔔 已切换到 *只转发模式*，私聊不会调用 GPT。", parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text("🔔 已切换到 *只转发模式*（私聊将转发给 OWNER，不调用 GPT）。", parse_mode=ParseMode.MARKDOWN)
 
 async def chat_mode_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global chat_mode
     chat_mode = True
-    await update.message.reply_text("💬 已切换到 *聊天模式*，私聊会调用 GPT。", parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text("💬 已切换到 *聊天模式*（私聊将调用 GPT）。", parse_mode=ParseMode.MARKDOWN)
 
 user_messages = {}
 KEYWORDS = ["Netflix", "YouTube", "shared", "rent", "group", "上车", "合租"]
@@ -81,13 +81,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     username = user.username or "NoUsername"
     text = message.text or "[non-text message]"
 
-    # 私聊：仅在聊天模式下调用 GPT
+    # 私聊：按模式处理
     if chat_type == "private":
         if chat_mode:
+            # 聊天模式：直接调用 GPT
             reply = await ask_gpt(text, current_model)
             await message.reply_text(reply, parse_mode=ParseMode.MARKDOWN)
         else:
-            await message.reply_text("ℹ️ 当前是只转发模式，私聊不调用 GPT。")
+            # 只转发模式：把私聊消息转发给 OWNER
+            forward_text = (
+                f"📬 *Private DM*
+"
+                f"👤 From: @{username}
+"
+                f"🆔 User ID: {uid}
+"
+                f"💬 Message:
+{text}"
+            )
+            await context.bot.send_message(chat_id=OWNER_ID, text=forward_text, parse_mode=ParseMode.MARKDOWN)
+            # 告知用户已转发
+            await message.reply_text("✅ 已转发你的消息给管理员。")
         return
 
     # 群聊关键词监听 + 摘要转发
@@ -122,5 +136,5 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("start", start_mode))
     app.add_handler(CommandHandler("chat", chat_mode_on))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
-    print("TgRentalBot with GPT-5-mini (模式切换版) is running...")
+    print("TgRentalBot with GPT-5-mini (模式切换+私聊转发) is running...")
     app.run_polling()
