@@ -1,2 +1,7 @@
 python-telegram-bot==20.7
+<<<<<<< HEAD
 openai>=1.30.0
+=======
+requests==2.31.0
+openai==1.14.3
+>>>>>>> 7b060b5041f71e7534763dedd73bb22015ba166b
