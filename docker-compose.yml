@@ -1,0 +1,13 @@
+services:
+  tgrentalbot:
+    build: .
+    container_name: tgrentalbot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - TZ=Asia/Shanghai
+    working_dir: /app
+    command: python main.py
+    # ports:
+    #   - "8000:8000"
