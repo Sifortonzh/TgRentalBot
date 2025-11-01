@@ -20,6 +20,12 @@ This pack contains production-ready files to run TgRentalBot with Docker on any 
 
 ## Quick Start
 1) Copy these files into the repository root.
+   ```bash
+   # example
+   cd /opt
+   # clone repo
+   git clone https://github.com/Sifortonzh/TgRentalBot.git
+   ```
 2) Create `.env` from the template and fill `BOT_TOKEN`, `OWNER_ID` (numeric), and optionally `OPENAI_API_KEY`.
 3) Build & run:
    ```bash

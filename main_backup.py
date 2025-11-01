@@ -67,8 +67,8 @@ async def ask_gpt(prompt: str, model: str) -> str:
                 {"role": "user", "content": prompt},
             ],
         )
-        # New SDK returns .content
-        return resp.choices[0].message.content.strip()
+        # New SDK returns .message["content"]
+        return resp.choices[0].message["content"].strip()
 
     try:
         return await asyncio.to_thread(_run)
