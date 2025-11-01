@@ -1,10 +1,12 @@
 import os
 import asyncio
-from typing import Dict, List
+import html
+import logging
+from typing import Dict, List, Optional
 
 from openai import OpenAI
 from telegram import Update
-from telegram.constants import ParseMode
+from telegram.constants import ChatType, ParseMode
 from telegram.ext import (
     ApplicationBuilder,
     ContextTypes,
@@ -13,53 +15,103 @@ from telegram.ext import (
     filters,
 )
 
-# ----------------------
-# Environment
-# ----------------------
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OWNER_ID_ENV = os.getenv("OWNER_ID")
+# ============================================================================
+# Configuration
+# ============================================================================
 
-if not BOT_TOKEN or not OPENAI_API_KEY or not OWNER_ID_ENV:
-    raise ValueError("Missing required environment variables: BOT_TOKEN / OPENAI_API_KEY / OWNER_ID")
+# Tokens/keys are read from environment variables.
+BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 
-try:
-    OWNER_ID = int(OWNER_ID_ENV)
-except Exception:
-    raise ValueError("OWNER_ID must be an integer user id, not @username.")
+# Optional: comma-separated chat IDs to receive forwarded private DMs.
+# Example: FORWARD_TO="-1001234567890,123456789"
+FORWARD_TO_RAW = os.environ.get("FORWARD_TO", "").strip()
+FORWARD_TO: List[int] = []
+if FORWARD_TO_RAW:
+    for _id in FORWARD_TO_RAW.split(","):
+        _id = _id.strip()
+        if not _id:
+            continue
+        try:
+            FORWARD_TO.append(int(_id))
+        except ValueError:
+            # Ignore invalid values (only integers are valid Telegram chat IDs).
+            pass
 
-# ----------------------
-# OpenAI client
-# ----------------------
-client = OpenAI(api_key=OPENAI_API_KEY)
+# Default OpenAI model (can be changed at runtime via /model command).
+DEFAULT_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5-mini")
 
-# Default model and chat mode
-current_model: str = "gpt-5-mini"
-# False = forward-only mode (/start); True = chat mode (/chat)
-chat_mode: bool = False
+# In-memory settings per chat.
+CHAT_MODE: Dict[int, str] = {}          # chat_id -> "forward" | "chat"
+MODEL_PER_CHAT: Dict[int, str] = {}     # chat_id -> model string
 
-# Keyword watch list (group)
-KEYWORDS: List[str] = ["Netflix", "YouTube", "shared", "rent", "group", "上车", "合租"]
+# Lazily-created OpenAI client (avoids crash on import when key is missing).
+_client: Optional[OpenAI] = None
 
-# Cache last messages per user for summary (group)
-user_messages: Dict[int, List[str]] = {}
-
-# ----------------------
-# System prompt
-# ----------------------
+# System prompt must be English as requested.
 SYSTEM_PROMPT = (
-    "你是一个风格独特的 AI 助手，说话有点拽，风趣但不低俗，"
-    "中文为主，偶尔夹杂英文。你擅长用文艺、哲理、调皮的语言回答问题，"
-    "不走寻常路，拒绝废话，回答要简洁有力，偶尔带点诗意或黑色幽默。"
-    "别太端着，也别太舔。"
+    "You are a helpful assistant inside a Telegram bot. "
+    "Be concise, factual, and reply in the user's language. "
+    "When asked for analysis, explain briefly and clearly."
 )
 
-# ----------------------
-# Helpers
-# ----------------------
+# Logging setup.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+log = logging.getLogger("TgRentalBot")
+
+
+# ============================================================================
+# OpenAI helpers
+# ============================================================================
+
+def get_client() -> OpenAI:
+    """Return a singleton OpenAI client (OpenAI SDK >= 1.x)."""
+    global _client
+    if _client is None:
+        if not OPENAI_API_KEY:
+            raise RuntimeError("OPENAI_API_KEY is not configured.")
+        _client = OpenAI(api_key=OPENAI_API_KEY)
+    return _client
+
+
+def get_model(chat_id: int) -> str:
+    """Get the chosen model for a chat; fall back to default."""
+    return MODEL_PER_CHAT.get(chat_id, DEFAULT_MODEL)
+
+
+def set_mode(chat_id: int, mode: str) -> None:
+    """Set mode for a chat. Allowed values: 'forward' or 'chat'."""
+    CHAT_MODE[chat_id] = mode
+
+
+def get_mode(chat_id: int) -> str:
+    """Get mode for a chat. Default is 'forward' to keep forwarding behavior."""
+    return CHAT_MODE.get(chat_id, "forward")
+
+
+def _extract_choice_content(resp) -> str:
+    """
+    Return assistant text from the first choice.
+    Supports both OpenAI 1.x object style and 0.x dict style for extra safety.
+    """
+    try:
+        # New SDK (>=1.x): strong-typed objects.
+        return resp.choices[0].message.content
+    except AttributeError:
+        # Old SDK (<=0.28): dictionary access.
+        return resp["choices"][0]["message"]["content"]
+
+
 async def ask_gpt(prompt: str, model: str) -> str:
-    """Call OpenAI chat completion using the new SDK in a thread."""
-    def _run():
+    """
+    Query OpenAI Chat Completions in a worker thread.
+    Returns assistant text, or a short error string if something fails.
+    """
+    def _call_api() -> str:
+        client = get_client()
         resp = client.chat.completions.create(
             model=model,
             messages=[
@@ -67,145 +119,188 @@ async def ask_gpt(prompt: str, model: str) -> str:
                 {"role": "user", "content": prompt},
             ],
         )
-        # New SDK returns .content
-        return resp.choices[0].message.content.strip()
+        return _extract_choice_content(resp).strip()
 
     try:
-        return await asyncio.to_thread(_run)
+        return await asyncio.to_thread(_call_api)
     except Exception as e:
-        return f"❌ Error from GPT: {e}"
+        # Keep error compact for Telegram UI.
+        return f"❌ Error from GPT: {type(e).__name__}: {e}"
 
 
-def build_lines_header(title: str, username: str, uid: int) -> str:
-    lines = [
-        title,
-        f"👤 From: @{username}" if username != "NoUsername" else f"👤 From: (no username)",
-        f"🆔 User ID: {uid}",
-    ]
-    return "\n".join(lines)
+# ============================================================================
+# Telegram command handlers
+# ============================================================================
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show a quick help and current state."""
+    chat_id = update.effective_chat.id
+    msg = (
+        "✅ Bot is running.\n"
+        f"• Mode: <b>{html.escape(get_mode(chat_id))}</b>\n"
+        f"• Model: <b>{html.escape(get_model(chat_id))}</b>\n\n"
+        "Commands:\n"
+        "/chat – switch to Chat mode (GPT replies in private chats)\n"
+        "/forward – switch to Forward-only mode\n"
+        "/model &lt;name&gt; – set OpenAI model\n"
+        "/status – show current mode/model\n"
+        "/ping – health check"
+    )
+    await update.effective_chat.send_message(msg, parse_mode=ParseMode.HTML)
 
 
-# ----------------------
-# Commands
-# ----------------------
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global chat_mode
-    chat_mode = False
-    lines = [
-        "🔔 已切换到 *只转发模式*",        "📌 私聊消息将转发给管理员，不调用 GPT",        f"📦 当前模型：{current_model}",
-    ]
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Simple liveness probe."""
+    await update.effective_chat.send_message("✅ I'm alive")
 
 
-async def cmd_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global chat_mode
-    chat_mode = True
-    lines = [
-        "💬 已切换到 *聊天模式*",        "📌 私聊将调用 GPT 回复（群聊仍会关键词监听并转发）",        f"📦 当前模型：{current_model}",
-    ]
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Report current mode and model."""
+    chat_id = update.effective_chat.id
+    await update.effective_chat.send_message(
+        f"📦 Current mode: <b>{html.escape(get_mode(chat_id))}</b>\n"
+        f"🧠 Current model: <b>{html.escape(get_model(chat_id))}</b>",
+        parse_mode=ParseMode.HTML
+    )
 
 
-async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global current_model
-    allowed = ["gpt-5-mini", "gpt-5", "gpt-5-pro"]
-    if context.args:
-        model_choice = context.args[0]
-        if model_choice in allowed:
-            current_model = model_choice
-            await update.message.reply_text(f"✅ Model switched to: {current_model}")
-        else:
-            await update.message.reply_text("❌ Invalid model. Allowed: " + ", ".join(allowed))
-    else:
-        await update.message.reply_text(f"ℹ️ Current model: {current_model}")
+async def cmd_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Switch to Chat mode (GPT replies in private chats)."""
+    set_mode(update.effective_chat.id, "chat")
+    await update.effective_chat.send_message(
+        "💬 Switched to <b>Chat mode</b>. "
+        "Send a message in private chat and I will reply with GPT.",
+        parse_mode=ParseMode.HTML
+    )
 
 
-async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    mode_text = "聊天模式" if chat_mode else "只转发模式"
-    lines = [
-        f"📊 当前模式：{mode_text}",
-        f"📦 当前模型：{current_model}",
-    ]
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+async def cmd_forward(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Switch to Forward-only mode."""
+    set_mode(update.effective_chat.id, "forward")
+    await update.effective_chat.send_message(
+        "📨 Switched to <b>Forward-only mode</b>. "
+        "Private messages will be forwarded when configured.",
+        parse_mode=ParseMode.HTML
+    )
 
 
-async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("✅ I'm alive")
-
-
-# ----------------------
-# Message handler
-# ----------------------
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.message
-    if not message:
-        return
-
-    user = update.effective_user
-    username = user.username or "NoUsername"
-    uid = user.id
-    chat_type = message.chat.type
-    text = message.text or "[non-text message]"
-
-    # Private chat
-    if chat_type == "private":
-        if chat_mode:
-            # Chat mode: call GPT
-            reply = await ask_gpt(text, current_model)
-            await message.reply_text(reply, parse_mode=ParseMode.MARKDOWN)
-        else:
-            # Forward-only mode: forward private DM to OWNER
-            header = build_lines_header("📬 *Private DM*", username, uid)
-            forward_text = "\n\n".join([header, f"💬 Message:\n{text}"])
-            await context.bot.send_message(chat_id=OWNER_ID, text=forward_text, parse_mode=ParseMode.MARKDOWN)
-            await message.reply_text("✅ 已转发你的消息给管理员。", parse_mode=ParseMode.MARKDOWN)
-        return
-
-    # Group chat: keyword detection + owner summary forward
-    triggered = any(k.lower() in text.lower() for k in KEYWORDS)
-    if triggered:
-        # keep last 5 messages for this user
-        msgs = user_messages.setdefault(uid, [])
-        msgs.append(text)
-        user_messages[uid] = msgs[-5:]
-
-        # Build summary prompt (single-line string + join, avoid f-string multiline issues)
-        summary_prompt = (
-            "Please summarize the following user messages into concise, useful points for the group owner. "
-            "Focus on any keyword-related content.\n\n"
-            + "\n".join(user_messages[uid])
+async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Set OpenAI model for this chat."""
+    chat_id = update.effective_chat.id
+    if not context.args:
+        await update.effective_chat.send_message(
+            "Usage: /model <name>\nExample: /model gpt-5-mini"
         )
-        summary = await ask_gpt(summary_prompt, current_model)
-
-        owner_header = build_lines_header("📩 *Group Trigger*", username, uid)
-        owner_body = "\n\n".join([
-            owner_header,
-            "🗣 Recent Messages:\n" + "\n".join(user_messages[uid]),
-            "🧠 Summary by GPT:\n" + summary,
-        ])
-        await context.bot.send_message(chat_id=OWNER_ID, text=owner_body, parse_mode=ParseMode.MARKDOWN)
-
-        # notify user in group
-        await message.reply_text(f"🔔 Hey @{username}, your message triggered a keyword alert!", parse_mode=ParseMode.MARKDOWN)
+        return
+    MODEL_PER_CHAT[chat_id] = context.args[0]
+    await update.effective_chat.send_message(
+        f"🧠 Model set to <b>{html.escape(context.args[0])}</b>.",
+        parse_mode=ParseMode.HTML
+    )
 
 
-# ----------------------
-# Entrypoint
-# ----------------------
-def main():
+# ============================================================================
+# Forwarding helpers (kept minimal to preserve the basic forwarding feature)
+# ============================================================================
+
+def _format_private_forward(update: Update) -> str:
+    """
+    Build a readable message for forwarding private DMs.
+    Only text content is handled here to keep behavior minimal.
+    """
+    user = update.effective_user
+    text = update.effective_message.text or ""
+    name = (user.full_name or "").strip()
+    username = f"@{user.username}" if user and user.username else "(no username)"
+    uid = user.id if user else 0
+
+    body = (
+        "📬 <b>Private DM</b>\n"
+        f"👤 From: <b>{html.escape(name)}</b> {html.escape(username)}\n"
+        f"🆔 User ID: <code>{uid}</code>\n\n"
+        "💭 Message:\n"
+        f"{html.escape(text)}"
+    )
+    return body
+
+
+async def forward_if_needed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Forward private messages to the configured targets. If FORWARD_TO is empty,
+    this function silently does nothing.
+    """
+    if not FORWARD_TO:
+        return
+
+    chat = update.effective_chat
+    if chat.type == ChatType.PRIVATE:
+        message = _format_private_forward(update)
+        for target in FORWARD_TO:
+            # Avoid echoing back into the same chat.
+            if target == chat.id:
+                continue
+            try:
+                await context.bot.send_message(
+                    chat_id=target,
+                    text=message,
+                    parse_mode=ParseMode.HTML
+                )
+            except Exception as e:
+                log.warning("Forwarding to %s failed: %s", target, e)
+
+
+# ============================================================================
+# Unified message handler
+# ============================================================================
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Route messages by current mode:
+      - 'forward': only forward private DMs.
+      - 'chat': in private chats, call GPT and reply; groups are ignored.
+    """
+    chat = update.effective_chat
+    mode = get_mode(chat.id)
+
+    # Always try forwarding private DMs if configured.
+    await forward_if_needed(update, context)
+
+    # Chat mode only responds in private chats.
+    if mode != "chat" or chat.type != ChatType.PRIVATE:
+        return
+
+    text = update.effective_message.text or ""
+    if not text.strip():
+        return
+
+    model = get_model(chat.id)
+    reply = await ask_gpt(text, model=model)
+    await update.effective_message.reply_text(reply)
+
+
+# ============================================================================
+# Application bootstrap
+# ============================================================================
+
+def main() -> None:
+    """Start the Telegram bot with polling."""
+    if not BOT_TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is not configured.")
+
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     # Commands
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("chat", cmd_chat))
-    app.add_handler(CommandHandler("model", cmd_model))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("ping", cmd_ping))
+    app.add_handler(CommandHandler("chat", cmd_chat))
+    app.add_handler(CommandHandler("forward", cmd_forward))
+    app.add_handler(CommandHandler("model", cmd_model))
 
-    # Messages
+    # Non-command text messages
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
 
-    print("TgRentalBot loaded. Mode=Forward-only, Model=gpt-5-mini")  # default
+    log.info("TgRentalBot started. Default mode=forward, model=%s", DEFAULT_MODEL)
     app.run_polling(drop_pending_updates=True, timeout=60)
 
 
