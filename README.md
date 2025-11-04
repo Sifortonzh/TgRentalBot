@@ -1,8 +1,9 @@
 # TgRentalBot – Docker Deployment Pack
 
-This pack contains production-ready files to run TgRentalBot with Docker on any VPS/VM.
+This pack contains production-ready files to run TgRentalBot with Docker on any VPS/VM or **your server(s)**.
 
 **Included**
+
 - `Dockerfile`
 - `docker-compose.yml`
 - `.env.example`
@@ -10,7 +11,16 @@ This pack contains production-ready files to run TgRentalBot with Docker on any 
 
 > The bot uses long polling, so no inbound port is required. Use an outbound proxy only if your region blocks Telegram (mainland China, etc.).
 
+## Shortcuts
+
+Example for my Bot: [🧸SubCompany🧸](https://t.me/avecsubot)
+
+
+
+![Preview](./imgs/preview-1.png)
+
 ## Prerequisites
+
 - Docker Engine & Docker Compose v2
 - Project root contains `main.py` and `requirements.txt` aligned with:
   ```
@@ -26,7 +36,7 @@ This pack contains production-ready files to run TgRentalBot with Docker on any 
    # clone repo
    git clone https://github.com/Sifortonzh/TgRentalBot.git
    ```
-2) Create `.env` from the template and fill `BOT_TOKEN`, `OWNER_ID` (numeric), and optionally `OPENAI_API_KEY`.
+2) Create `.env` from the template and fill `TELEGRAM_BOT_TOKEN`, `FORWARD_TO` (numeric), and optionally `OPENAI_API_KEY`.
 3) Build & run:
    ```bash
    docker compose build --no-cache
