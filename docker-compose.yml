@@ -1,13 +1,16 @@
+version: "3.9"
 services:
   tgrentalbot:
     build: .
     container_name: tgrentalbot
-    restart: unless-stopped
-    env_file:
-      - .env
+    command: python -u main.py
+    env_file: .env
     environment:
-      - TZ=Asia/Shanghai
-    working_dir: /app
-    command: python main.py
-    # ports:
-    #   - "8000:8000"
+      TZ: Asia/Singapore
+    restart: unless-stopped
+    networks:
+      - wanatring
+
+networks:
+  wanatring:
+    driver: bridge
