@@ -2,7 +2,7 @@ import os
 import asyncio
 import html
 import logging
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple, Set
 
 from openai import OpenAI
 from telegram import Update
@@ -14,17 +14,16 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+from telegram.error import RetryAfter, Forbidden
 
 # ============================================================================
 # Configuration
 # ============================================================================
 
-# Tokens/keys are read from environment variables.
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 
-# Optional: comma-separated chat IDs to receive forwarded private DMs.
-# Example: FORWARD_TO="-1001234567890,123456789"
+# Comma-separated chat IDs to receive forwarded private DMs.
 FORWARD_TO_RAW = os.environ.get("FORWARD_TO", "").strip()
 FORWARD_TO: List[int] = []
 if FORWARD_TO_RAW:
@@ -35,20 +34,39 @@ if FORWARD_TO_RAW:
         try:
             FORWARD_TO.append(int(_id))
         except ValueError:
-            # Ignore invalid values (only integers are valid Telegram chat IDs).
-            pass
+            pass  # Ignore invalid chat IDs
 
-# Default OpenAI model (can be changed at runtime via /model command).
+# Comma-separated owner (admin) user IDs. Messages from these users are ignored
+# for GPT replies and forwarding, but their replies to header messages are allowed.
+OWNER_IDS_RAW = os.environ.get("OWNER_IDS", "").strip()
+OWNER_IDS: Set[int] = set()
+if OWNER_IDS_RAW:
+    for _id in OWNER_IDS_RAW.split(","):
+        _id = _id.strip()
+        if not _id:
+            continue
+        try:
+            OWNER_IDS.add(int(_id))
+        except ValueError:
+            pass  # Ignore invalid user IDs
+
 DEFAULT_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5-mini")
+
+# Auth: only authorized users can use GPT chat (non-owners). Set a shared password.
+AUTH_PASSWORD = os.environ.get("AUTH_PASSWORD", "").strip()
+# In-memory authorized user id set (non-persistent). Consider persisting if needed.
+AUTHORIZED_USERS: Set[int] = set()
 
 # In-memory settings per chat.
 CHAT_MODE: Dict[int, str] = {}          # chat_id -> "forward" | "chat"
 MODEL_PER_CHAT: Dict[int, str] = {}     # chat_id -> model string
 
-# Lazily-created OpenAI client (avoids crash on import when key is missing).
+# Reply bridge map: (target_chat_id, forwarded_header_msg_id) -> original_user_id
+REPLY_MAP: Dict[Tuple[int, int], int] = {}
+
+# Lazily-created OpenAI client.
 _client: Optional[OpenAI] = None
 
-# System prompt must be English as requested.
 SYSTEM_PROMPT = (
     "You are a helpful assistant inside a Telegram bot. "
     "Be concise, factual, and reply in the user's language. "
@@ -60,7 +78,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 )
-log = logging.getLogger("TgRentalBot")
+log = logging.getLogger("Wanatring-Yaoyu-Bot")
 
 
 # ============================================================================
@@ -92,24 +110,32 @@ def get_mode(chat_id: int) -> str:
     return CHAT_MODE.get(chat_id, "forward")
 
 
+def is_owner_id(user_id: Optional[int]) -> bool:
+    """Return True if the given Telegram user_id is configured as an owner/admin."""
+    if user_id is None:
+        return False
+    return user_id in OWNER_IDS
+
+
+def is_authorized_user(user_id: Optional[int]) -> bool:
+    if user_id is None:
+        return False
+    # Owners are implicitly allowed for chat even without password
+    if is_owner_id(user_id):
+        return True
+    return user_id in AUTHORIZED_USERS
+
+
 def _extract_choice_content(resp) -> str:
-    """
-    Return assistant text from the first choice.
-    Supports both OpenAI 1.x object style and 0.x dict style for extra safety.
-    """
+    """Return assistant text from first choice (OpenAI 1.x or 0.x style)."""
     try:
-        # New SDK (>=1.x): strong-typed objects.
         return resp.choices[0].message.content
     except AttributeError:
-        # Old SDK (<=0.28): dictionary access.
         return resp["choices"][0]["message"]["content"]
 
 
 async def ask_gpt(prompt: str, model: str) -> str:
-    """
-    Query OpenAI Chat Completions in a worker thread.
-    Returns assistant text, or a short error string if something fails.
-    """
+    """Call OpenAI Chat Completions in a worker thread."""
     def _call_api() -> str:
         client = get_client()
         resp = client.chat.completions.create(
@@ -124,16 +150,14 @@ async def ask_gpt(prompt: str, model: str) -> str:
     try:
         return await asyncio.to_thread(_call_api)
     except Exception as e:
-        # Keep error compact for Telegram UI.
         return f"❌ Error from GPT: {type(e).__name__}: {e}"
 
 
 # ============================================================================
-# Telegram command handlers
+# Telegram commands
 # ============================================================================
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show a quick help and current state."""
     chat_id = update.effective_chat.id
     msg = (
         "✅ Bot is running.\n"
@@ -144,18 +168,20 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/forward – switch to Forward-only mode\n"
         "/model &lt;name&gt; – set OpenAI model\n"
         "/status – show current mode/model\n"
-        "/ping – health check"
+        "/ping – health check\n"
+        "/auth &lt;password&gt; – authorize non-owners to use GPT chat\n\n"
+        "💡 Reply bridge: Reply to the bot's forwarded header message in any chat to answer the original user.\n"
+        "🔒 Owner policy: Owners can <b>chat with GPT</b> (private) and can <b>reply to forwarded headers</b> to message the original user.\n"
+        "🔐 Non-owners must /auth before using GPT chat (to protect API key)."
     )
     await update.effective_chat.send_message(msg, parse_mode=ParseMode.HTML)
 
 
 async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Simple liveness probe."""
     await update.effective_chat.send_message("✅ I'm alive")
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Report current mode and model."""
     chat_id = update.effective_chat.id
     await update.effective_chat.send_message(
         f"📦 Current mode: <b>{html.escape(get_mode(chat_id))}</b>\n"
@@ -165,27 +191,22 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def cmd_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Switch to Chat mode (GPT replies in private chats)."""
     set_mode(update.effective_chat.id, "chat")
     await update.effective_chat.send_message(
-        "💬 Switched to <b>Chat mode</b>. "
-        "Send a message in private chat and I will reply with GPT.",
+        "💬 Switched to <b>Chat mode</b>. Send a message in private chat and I will reply with GPT.",
         parse_mode=ParseMode.HTML
     )
 
 
 async def cmd_forward(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Switch to Forward-only mode."""
     set_mode(update.effective_chat.id, "forward")
     await update.effective_chat.send_message(
-        "📨 Switched to <b>Forward-only mode</b>. "
-        "Private messages will be forwarded when configured.",
+        "📨 Switched to <b>Forward-only mode</b>. Private messages will be forwarded when configured.",
         parse_mode=ParseMode.HTML
     )
 
 
 async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Set OpenAI model for this chat."""
     chat_id = update.effective_chat.id
     if not context.args:
         await update.effective_chat.send_message(
@@ -199,15 +220,45 @@ async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def cmd_auth(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id if update.effective_user else None
+    if user_id is None:
+        return
+
+    if is_owner_id(user_id):
+        await update.effective_chat.send_message("🔑 Owner detected: you already have access to chat.")
+        return
+
+    if not AUTH_PASSWORD:
+        await update.effective_chat.send_message("❌ This bot requires no password right now. Please contact the owner if you think this is a mistake.")
+        return
+
+    if not context.args:
+        await update.effective_chat.send_message("Usage: /auth <password>")
+        return
+
+    if context.args[0] == AUTH_PASSWORD:
+        AUTHORIZED_USERS.add(user_id)
+        await update.effective_chat.send_message("✅ Authorized. You can now chat with GPT in private.")
+    else:
+        await update.effective_chat.send_message("❌ Wrong password.")
+
+
 # ============================================================================
-# Forwarding helpers (kept minimal to preserve the basic forwarding feature)
+# Forwarding + reply bridge
 # ============================================================================
 
-def _format_private_forward(update: Update) -> str:
-    """
-    Build a readable message for forwarding private DMs.
-    Only text content is handled here to keep behavior minimal.
-    """
+async def _safe_send(coro):
+    """Run a Telegram API coroutine with gentle rate limiting & retry on 429."""
+    try:
+        return await coro
+    except RetryAfter as e:
+        await asyncio.sleep(int(getattr(e, "retry_after", 2)) + 1)
+        return await coro
+
+
+def _format_private_header(update: Update) -> str:
+    """Header message that explains how to reply back to the original user."""
     user = update.effective_user
     text = update.effective_message.text or ""
     name = (user.full_name or "").strip()
@@ -219,34 +270,83 @@ def _format_private_forward(update: Update) -> str:
         f"👤 From: <b>{html.escape(name)}</b> {html.escape(username)}\n"
         f"🆔 User ID: <code>{uid}</code>\n\n"
         "💭 Message:\n"
-        f"{html.escape(text)}"
+        f"{html.escape(text)}\n\n"
+        "↩️ <i>Reply to this message to answer the user via the bot.</i>"
     )
     return body
 
 
 async def forward_if_needed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Forward private messages to the configured targets. If FORWARD_TO is empty,
-    this function silently does nothing.
-    """
+    """Forward private messages to configured targets and create a reply bridge."""
     if not FORWARD_TO:
         return
 
     chat = update.effective_chat
-    if chat.type == ChatType.PRIVATE:
-        message = _format_private_forward(update)
-        for target in FORWARD_TO:
-            # Avoid echoing back into the same chat.
-            if target == chat.id:
-                continue
-            try:
-                await context.bot.send_message(
+
+    # Do not forward messages authored by owners/admins.
+    user_id = update.effective_user.id if update.effective_user else None
+    if is_owner_id(user_id):
+        return
+
+    if chat.type != ChatType.PRIVATE:
+        return
+
+    user_id = update.effective_user.id if update.effective_user else 0
+    msg = update.effective_message
+    header = _format_private_header(update)
+
+    for target in FORWARD_TO:
+        if target == chat.id:
+            continue
+        try:
+            header_msg = await _safe_send(context.bot.send_message(
+                chat_id=target,
+                text=header,
+                parse_mode=ParseMode.HTML
+            ))
+            if header_msg and getattr(header_msg, "message_id", None):
+                REPLY_MAP[(target, header_msg.message_id)] = user_id
+
+            if not msg.text:
+                await _safe_send(context.bot.copy_message(
                     chat_id=target,
-                    text=message,
-                    parse_mode=ParseMode.HTML
-                )
-            except Exception as e:
-                log.warning("Forwarding to %s failed: %s", target, e)
+                    from_chat_id=chat.id,
+                    message_id=msg.message_id
+                ))
+        except Forbidden as e:
+            log.warning("Forward forbidden to %s: %s", target, e)
+        except Exception as e:
+            log.warning("Forward failed to %s: %s", target, e)
+
+
+async def handle_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Deliver replies back to the original user.
+    Works in ANY chat, including your private DM with the bot.
+    """
+    m = update.effective_message
+    if not m or not m.reply_to_message:
+        return
+
+
+    key = (update.effective_chat.id, m.reply_to_message.message_id)
+    user_id = REPLY_MAP.get(key)
+    if not user_id:
+        return  # not replying to a header we sent
+
+    try:
+        if m.text:
+            await _safe_send(context.bot.send_message(chat_id=user_id, text=m.text))
+        else:
+            await _safe_send(context.bot.copy_message(
+                chat_id=user_id,
+                from_chat_id=update.effective_chat.id,
+                message_id=m.message_id
+            ))
+    except Forbidden as e:
+        await m.reply_text(f"❌ Cannot deliver: {e}")
+    except Exception as e:
+        await m.reply_text(f"❌ Delivery failed: {e}")
 
 
 # ============================================================================
@@ -254,19 +354,24 @@ async def forward_if_needed(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 # ============================================================================
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Route messages by current mode:
-      - 'forward': only forward private DMs.
-      - 'chat': in private chats, call GPT and reply; groups are ignored.
-    """
     chat = update.effective_chat
+
+    user_id = update.effective_user.id if update.effective_user else None
     mode = get_mode(chat.id)
 
-    # Always try forwarding private DMs if configured.
+    # Keep forwarding behavior (but forward_if_needed() already skips owners)
     await forward_if_needed(update, context)
 
-    # Chat mode only responds in private chats.
-    if mode != "chat" or chat.type != ChatType.PRIVATE:
+    # GPT chat is only in private chats and only in chat mode
+    if chat.type != ChatType.PRIVATE or mode != "chat":
+        return
+
+    # Authorization: owners are always allowed; others must be authorized
+    if not is_authorized_user(user_id):
+        if AUTH_PASSWORD:
+            await update.effective_message.reply_text("🔐 Unauthorized. Use /auth <password> to enable GPT chat.")
+        else:
+            await update.effective_message.reply_text("🔐 GPT chat is restricted. Contact the owner for access.")
         return
 
     text = update.effective_message.text or ""
@@ -283,7 +388,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 # ============================================================================
 
 def main() -> None:
-    """Start the Telegram bot with polling."""
     if not BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is not configured.")
 
@@ -296,11 +400,20 @@ def main() -> None:
     app.add_handler(CommandHandler("chat", cmd_chat))
     app.add_handler(CommandHandler("forward", cmd_forward))
     app.add_handler(CommandHandler("model", cmd_model))
+    app.add_handler(CommandHandler("auth", cmd_auth))
+
+    # Replies to our header messages in ANY chat (group or private)
+    app.add_handler(MessageHandler(filters.REPLY & filters.ALL, handle_reply))
 
     # Non-command text messages
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
 
-    log.info("TgRentalBot started. Default mode=forward, model=%s", DEFAULT_MODEL)
+    log.info(
+        "Wanatring·Yaoyu bot started. Default mode=forward, model=%s, owners=%s, auth_required=%s",
+        DEFAULT_MODEL,
+        sorted(list(OWNER_IDS)) if OWNER_IDS else [],
+        bool(AUTH_PASSWORD),
+    )
     app.run_polling(drop_pending_updates=True, timeout=60)
 
 
